@@ -19,7 +19,6 @@ repos:
     hooks:
       - id: mypy
         # NOTE: Exclusions are handled in pyproject.toml
-        files: rayllm
         exclude: tests
         additional_dependencies:
           - mypy-extensions

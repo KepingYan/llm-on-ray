@@ -22,7 +22,7 @@ import gradio as gr
 import argparse
 import paramiko
 from multiprocessing import Process, Queue
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Union
 import ray
 from ray import serve
 from ray.tune import Stopper
@@ -52,62 +52,18 @@ from pyrecdp.primitives.operations import (
 from pyrecdp.primitives.document.reader import _default_file_readers
 from pyrecdp.core.cache_utils import RECDP_MODELS_CACHE
 
+import yaml
+from ray.job_submission import JobSubmissionClient
+import datetime
+
 if ("RECDP_CACHE_HOME" not in os.environ) or (not os.environ["RECDP_CACHE_HOME"]):
     os.environ["RECDP_CACHE_HOME"] = os.getcwd()
-
-
-class CustomStopper(Stopper):
-    def __init__(self):
-        self.should_stop = False
-
-    def __call__(self, trial_id: str, result: dict) -> bool:
-        return self.should_stop
-
-    def stop_all(self) -> bool:
-        """Returns whether to stop trials and prevent new ones from starting."""
-        return self.should_stop
-
-    def stop(self, flag):
-        self.should_stop = flag
 
 
 def is_simple_api(request_url, model_name):
     if model_name is None or len(model_name) == 0:
         return True
     return model_name in request_url
-
-
-@ray.remote
-class Progress_Actor:
-    def __init__(self, config) -> None:
-        self.config = config
-
-    def track_progress(self):
-        if "epoch_value" not in self.config:
-            return -1, -1, -1, -1
-        if not self.config["epoch_value"].empty():
-            total_epochs = self.config["total_epochs"].get(block=False)
-            total_steps = self.config["total_steps"].get(block=False)
-            value_epoch = self.config["epoch_value"].get(block=False)
-            value_step = self.config["step_value"].get(block=False)
-            return total_epochs, total_steps, value_epoch, value_step
-        return -1, -1, -1, -1
-
-
-class LoggingCallback(LoggerCallback):
-    def __init__(self, config) -> None:
-        self.config = config
-        self.results: List[Any] = []
-
-    def log_trial_result(self, iteration: int, trial, result: Dict):
-        if "train_epoch" in trial.last_result:
-            self.config["epoch_value"].put(trial.last_result["train_epoch"] + 1, block=False)
-            self.config["total_epochs"].put(trial.last_result["total_epochs"], block=False)
-            self.config["step_value"].put(trial.last_result["train_step"] + 1, block=False)
-            self.config["total_steps"].put(trial.last_result["total_steps"], block=False)
-
-    def get_result(self):
-        return self.results
 
 
 class ChatBotUI:
@@ -142,7 +98,6 @@ class ChatBotUI:
         self.ray_nodes = ray.nodes()
         self.ssh_connect = [None] * (len(self.ray_nodes) + 1)
         self.ip_port = "http://127.0.0.1:8000"
-        self.stopper = CustomStopper()
         self.test_replica = 4
         self.bot_queue = list(range(self.test_replica))
         self.messages = [
@@ -152,10 +107,11 @@ class ChatBotUI:
             "What is chatbot?",
         ]
         self.process_tool = None
-        self.finetune_actor = None
+        # self.finetune_actor = None
         self.finetune_status = False
         self.default_rag_path = default_rag_path
         self.embedding_model_name = "sentence-transformers/all-mpnet-base-v2"
+        self.client = JobSubmissionClient(address="auto")
         self._init_ui()
 
     @staticmethod
@@ -531,7 +487,6 @@ class ChatBotUI:
         self,
         model_name,
         custom_model_name,
-        custom_tokenizer_name,
         dataset,
         new_model_name,
         batch_size,
@@ -544,7 +499,6 @@ class ChatBotUI:
         if model_name == "specify other models":
             model_desc = None
             origin_model_path = custom_model_name
-            tokenizer_path = custom_tokenizer_name
             if "gpt" in model_name.lower() or "pythia" in model_name.lower():
                 gpt_base_model = True
             else:
@@ -552,7 +506,6 @@ class ChatBotUI:
         else:
             model_desc = self._base_models[model_name].model_description
             origin_model_path = model_desc.model_id_or_path
-            tokenizer_path = model_desc.tokenizer_name_or_path
             gpt_base_model = model_desc.gpt_base_model
         last_gpt_base_model = False
         finetuned_model_path = os.path.join(self.finetuned_model_path, model_name, new_model_name)
@@ -609,6 +562,7 @@ class ChatBotUI:
 
         finetune_config["Dataset"]["train_file"] = dataset
         finetune_config["General"]["base_model"] = origin_model_path
+        finetune_config["General"]["gpt_base_model"] = gpt_base_model
         finetune_config["Training"]["epochs"] = num_epochs
         finetune_config["General"]["output_dir"] = finetuned_model_path
         finetune_config["General"]["config"]["trust_remote_code"] = True
@@ -619,46 +573,33 @@ class ChatBotUI:
         if max_train_step != 0:
             finetune_config["Training"]["max_train_steps"] = max_train_step
 
-        from llm_on_ray.finetune.finetune import main
-
-        finetune_config["total_epochs"] = queue.Queue(
-            actor_options={"resources": {"queue_hardware": 1}}
-        )
-        finetune_config["total_steps"] = queue.Queue(
-            actor_options={"resources": {"queue_hardware": 1}}
-        )
-        finetune_config["epoch_value"] = queue.Queue(
-            actor_options={"resources": {"queue_hardware": 1}}
-        )
-        finetune_config["step_value"] = queue.Queue(
-            actor_options={"resources": {"queue_hardware": 1}}
-        )
-        self.finetune_actor = Progress_Actor.options(resources={"queue_hardware": 1}).remote(
-            finetune_config
-        )
-
-        callback = LoggingCallback(finetune_config)
-        finetune_config["run_config"] = {}
-        finetune_config["run_config"]["callbacks"] = [callback]
-        self.stopper.stop(False)
-        finetune_config["run_config"]["stop"] = self.stopper
         self.finetune_status = False
-        # todo: a more reasonable solution is needed
-        try:
-            results = main(finetune_config)
-            if results.metrics["done"]:
-                self.finetune_status = True
-        except TrainingFailedError as e:
-            self.finetune_status = True
-            print("An error occurred, possibly due to failed recovery")
-            print(e)
+        timestamp = int(datetime.datetime.now().timestamp())
+        config_file_name = f"finetune_config_{timestamp}.yml"
+        with open(config_file_name, "w") as f:
+            yaml.dump(finetune_config, f)
+        submission_id = self.client.submit_job(
+            entrypoint=f"llm_on_ray-finetune --config_file {config_file_name}"
+        )
+        return submission_id
 
-        finetune_config["total_epochs"].shutdown(force=True)
-        finetune_config["total_steps"].shutdown(force=True)
-        finetune_config["epoch_value"].shutdown(force=True)
-        finetune_config["step_value"].shutdown(force=True)
-        ray.kill(self.finetune_actor)
-        self.finetune_actor = None
+    def finetune_watching(self, job_id, model_name, new_model_name, custom_tokenizer_name):
+        # client.list_jobs()     # get the list of jobs
+        # client.delete_job(submission_id)     # delete the job based on the submission_id
+        # client.get_job_status(submission_id)    # get the job status based on the submission_id, including "PENDING", "RUNNING", "STOPPED", "SUCCEEDED", "FAILED"
+        # client.get_job_info(submission_id)      # get the job details
+        # client.get_job_logs(submission_id)    # get the job logs
+        while True:
+            time.sleep(2)
+            status = self.client.get_job_status(job_id)
+            if status == "SUCCEEDED":
+                gr.Info("Completed the fine-tuning process.")
+                break
+            elif status == "FAILED":
+                raise gr.Error("Job failed.")
+            elif status == "STOPPED":
+                gr.Info("The job is stopped.")
+                break
 
         new_prompt = Prompt()
         new_prompt.intro = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n"
@@ -667,6 +608,13 @@ class ChatBotUI:
         new_prompt.stop_words.extend(
             ["### Instruction", "# Instruction", "### Question", "##", " ="]
         )
+        finetuned_model_path = os.path.join(self.finetuned_model_path, model_name, new_model_name)
+        if model_name == "specify other models":
+            model_desc = None
+            tokenizer_path = custom_tokenizer_name
+        else:
+            model_desc = self._base_models[model_name].model_description
+            tokenizer_path = model_desc.tokenizer_name_or_path
         new_model_desc = ModelDescription(
             model_id_or_path=finetuned_model_path,
             tokenizer_name_or_path=tokenizer_path,
@@ -681,41 +629,6 @@ class ChatBotUI:
         )
         self._all_models[new_model_name] = new_finetuned
         return gr.Dropdown.update(choices=list(self._all_models.keys()))
-
-    def finetune_progress(self, progress=gr.Progress()):
-        finetune_flag = False
-        while True:
-            time.sleep(1)
-            if self.finetune_actor is None:
-                if finetune_flag is False:
-                    continue
-                else:
-                    break
-            if self.finetune_status is True:
-                break
-            finetune_flag = True
-            try:
-                total_epochs, total_steps, value_epoch, value_step = ray.get(
-                    self.finetune_actor.track_progress.remote()
-                )
-                if value_epoch == -1:
-                    continue
-                progress(
-                    float(int(value_step) / int(total_steps)),
-                    desc="Start Training: epoch "
-                    + str(value_epoch)
-                    + " / "
-                    + str(total_epochs)
-                    + "  "
-                    + "step "
-                    + str(value_step)
-                    + " / "
-                    + str(total_steps),
-                )
-            except Exception:
-                pass
-        self.finetune_status = False
-        return "<h4 style='text-align: left; margin-bottom: 1rem'>Completed the fine-tuning process.</h4>"
 
     def deploy_func(self, model_name: str, replica_num: int, cpus_per_worker_deploy: int):
         self.shutdown_deploy()
@@ -744,19 +657,22 @@ class ChatBotUI:
         finetuned_deploy.device = "cpu"
         finetuned_deploy.ipex.precision = "bf16"
         finetuned_deploy.cpus_per_worker = cpus_per_worker_deploy
+        pip_env = None
         # transformers 4.35 is needed for neural-chat-7b-v3-1, will be fixed later
         if "neural-chat" in model_name:
             pip_env = "transformers==4.35.0"
         elif "fuyu-8b" in model_name:
             pip_env = "transformers==4.37.2"
-        else:
-            pip_env = "transformers==4.31.0"
+        # else:
+        #     pip_env = "transformers==4.31.0"
+        ray_actor_options: Dict[str, Any] = {
+            "num_cpus": cpus_per_worker_deploy,
+            # "runtime_env": {"pip": [pip_env]},
+        }
+        if pip_env is not None:
+            ray_actor_options["runtime_env"] = {"pip": [pip_env]}
         deployment = PredictorDeployment.options(  # type: ignore
-            num_replicas=replica_num,
-            ray_actor_options={
-                "num_cpus": cpus_per_worker_deploy,
-                "runtime_env": {"pip": [pip_env]},
-            },
+            num_replicas=replica_num, ray_actor_options=ray_actor_options
         ).bind(finetuned_deploy)
         serve.run(
             deployment,
@@ -772,8 +688,9 @@ class ChatBotUI:
         )
         return endpoint, endpoint, None, endpoint, None
 
-    def shutdown_finetune(self):
-        self.stopper.stop(True)
+    def shutdown_finetune(self, job_id):
+        self.client.stop_job(job_id)
+        gr.Info("The job is stopped.")
 
     def shutdown_deploy(self):
         serve.shutdown()
@@ -974,6 +891,9 @@ class ChatBotUI:
                         interactive=True,
                         elem_classes="disable_status",
                     )
+                    job_id = gr.Textbox(
+                        label="submit finetune job id", placeholder="", visible=False
+                    )
 
                 with gr.Accordion("Parameters", open=False, visible=True):
                     batch_size = gr.Slider(
@@ -1041,7 +961,7 @@ class ChatBotUI:
                         stop_finetune_btn = gr.Button("Stop")
 
                 with gr.Row():
-                    finetune_res = gr.HTML(
+                    gr.HTML(
                         "<h4 style='text-align: left; margin-bottom: 1rem'></h4>",
                         show_label=False,
                         elem_classes="disable_status",
@@ -1411,7 +1331,7 @@ class ChatBotUI:
                                 gr.HTML(
                                     self.get_ray_cluster,
                                     elem_classes="disablegenerating",
-                                    every=2,
+                                    every=1000,
                                 )
 
                 stop_btn = []
@@ -1434,7 +1354,7 @@ class ChatBotUI:
                                     func = lambda: self.watch_node_status(index=3)
 
                                 node_status.append(
-                                    gr.HTML(func, elem_classes="statusstyle", every=2)
+                                    gr.HTML(func, elem_classes="statusstyle", every=1000)
                                 )
                             with gr.Row():
                                 node_index.append(gr.Text(value=len(stop_btn), visible=False))
@@ -1489,7 +1409,7 @@ class ChatBotUI:
                                     elif index == 3:
                                         func = lambda: self.get_cpu_memory(index=3)
 
-                                    gr.HTML(func, elem_classes="disablegenerating", every=2)
+                                    gr.HTML(func, elem_classes="disablegenerating", every=1000)
 
             msg.submit(self.user, [msg, chatbot], [msg, chatbot], queue=False).then(
                 self.bot,
@@ -1628,7 +1548,6 @@ class ChatBotUI:
                 [
                     base_model_dropdown,
                     custom_model_name,
-                    custom_tokenizer_name,
                     data_url,
                     finetuned_model_name,
                     batch_size,
@@ -1638,16 +1557,17 @@ class ChatBotUI:
                     worker_num,
                     cpus_per_worker_ftn,
                 ],
+                [job_id],
+            ).then(
+                self.finetune_watching,
+                [job_id, base_model_dropdown, finetuned_model_name, custom_tokenizer_name],
                 [all_model_dropdown],
-            )
-            finetune_progress_event = finetune_btn.click(
-                self.finetune_progress, None, [finetune_res]
             )
             stop_finetune_btn.click(
                 fn=self.shutdown_finetune,
-                inputs=None,
+                inputs=[job_id],
                 outputs=None,
-                cancels=[finetune_event, finetune_progress_event],
+                cancels=[finetune_event],
             )
             deploy_event = deploy_btn.click(
                 self.deploy_func,
